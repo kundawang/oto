@@ -20,12 +20,38 @@ import (
 	"github.com/ebitengine/oto/v3/internal/mux"
 )
 
+// Category names a group of players for ducking. See Context.SetDucking.
+//
+// The zero Category is no category: a player in no category neither triggers
+// ducking nor is ducked.
+type Category string
+
 // Player is a PCM (pulse-code modulation) audio player.
 //
 // A player must be kept reachable as long as it should keep playing.
 // A player is closed when it becomes unreachable, even in the middle of playing.
 type Player struct {
 	player *mux.Player
+}
+
+// SetCategory sets the player's category and the priority of its ducking
+// triggers. A player in no category neither triggers ducking nor is ducked.
+// The default is no category and the priority 0.
+//
+// The priority orders the trigger categories when several of them duck the same
+// target, as configured by Context.SetDucking: the highest priority wins. It
+// has no effect on a player that is not a trigger.
+//
+// SetCategory is concurrent-safe.
+func (p *Player) SetCategory(category Category, priority int) {
+	p.player.SetCategory(mux.Category(category), priority)
+}
+
+// Category returns the player's category.
+//
+// Category is concurrent-safe.
+func (p *Player) Category() Category {
+	return Category(p.player.Category())
 }
 
 // Pause pauses its playing.

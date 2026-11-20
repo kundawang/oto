@@ -66,6 +66,27 @@ type Mux struct {
 	// mixed counts the samples ReadFloat32s has mixed.
 	mixed atomic.Int64
 
+	// duckingEnabled reports whether ducking can change a mix, so that the
+	// mixer can skip it entirely otherwise.
+	duckingEnabled atomic.Bool
+
+	// duckMu guards the ducking rules and the envelope state. The mixer holds
+	// it for a whole mix, so it is locked before a player's mutex, and never
+	// after one.
+	duckMu      sync.Mutex
+	duckRules   map[duckKey]ducking
+	duckStates  map[Category]*duckState
+	duckTargets []Category
+	// duckBuffers holds the envelope of each target, and retains the storage
+	// of the slices in duckGains.
+	duckBuffers map[Category][]float32
+	// duckGains holds the envelope of each target for the current mix.
+	duckGains map[Category][]float32
+	// duckActive holds the trigger categories of the current mix, with the
+	// highest priority of their playing players. It is only used while duckMu
+	// is held.
+	duckActive map[Category]int
+
 	// playedMu guards the driver's last report: frame playedFrame of the mix is
 	// played at playedAt, reported at reportedAt, while playedKnown is set.
 	playedMu    sync.Mutex
@@ -228,6 +249,10 @@ func (m *Mux) played() (int64, bool) {
 
 // Stop stops the Mux from reading the players' sources.
 func (m *Mux) Stop() {
+	// Take duckMu before cond.L, as nothing holds duckMu while it waits for
+	// cond.L.
+	m.resetDucking()
+
 	m.cond.L.Lock()
 	defer m.cond.L.Unlock()
 
@@ -252,11 +277,78 @@ func (m *Mux) ReadFloat32s(buf []float32) {
 		buf[i] = 0
 	}
 	start := m.mixed.Load()
-	for _, p := range players {
-		p.readBufferAndAdd(buf, start)
+
+	// Snapshot the ducking rules and the categories that trigger them before
+	// any player is mixed, so the whole buffer is mixed with one envelope and
+	// one view of what is playing. duckMu stays held through the mix: the gain
+	// slices are reused, and a mix must not see them changed by another.
+	// A player is locked while duckMu is held, never the other way around.
+	var states []playerDucking
+	m.duckMu.Lock()
+	if m.duckingEnabled.Load() {
+		states = m.playerDuckingStates(states[:0], players)
+		// Round a trailing partial frame up, so that its samples still get a
+		// gain even though they can never be played as a frame.
+		frames := (len(buf) + m.channelCount - 1) / m.channelCount
+		m.updateDuckGainsLocked(frames, m.activeCategoriesLocked(states))
 	}
+	for i, p := range players {
+		var playerGains []float32
+		if states != nil {
+			playerGains = m.duckGains[states[i].category]
+		}
+		p.readBufferAndAdd(buf, start, playerGains)
+	}
+	m.duckMu.Unlock()
+
 	m.mixed.Add(int64(len(buf)))
 	m.signal()
+}
+
+// playerDucking is a snapshot of what ducking needs of a player.
+type playerDucking struct {
+	category Category
+	priority int
+	playing  bool
+}
+
+// playerDuckingStates snapshots the ducking state of each player. duckMu is
+// held across the snapshot, so a player is locked while duckMu is held, and
+// duckMu must never be taken while a player is locked.
+func (m *Mux) playerDuckingStates(states []playerDucking, players []*playerImpl) []playerDucking {
+	for _, p := range players {
+		states = append(states, p.duckingState())
+	}
+	return states
+}
+
+// activeCategoriesLocked returns the trigger categories among the given
+// players, each with the highest priority of its playing players. The returned
+// map is reused from mix to mix. The mutex duckMu must be held.
+func (m *Mux) activeCategoriesLocked(players []playerDucking) map[Category]int {
+	if len(m.duckRules) == 0 {
+		return nil
+	}
+	active := m.duckActive
+	if active == nil {
+		active = map[Category]int{}
+	} else {
+		clear(active)
+	}
+	m.duckActive = active
+	for _, p := range players {
+		if !p.playing || p.category == "" {
+			continue
+		}
+		if !m.isDuckTriggerLocked(p.category) {
+			// A trigger category that no rule refers to cannot duck.
+			continue
+		}
+		if current, ok := active[p.category]; !ok || p.priority > current {
+			active[p.category] = p.priority
+		}
+	}
+	return active
 }
 
 type Player struct {
@@ -319,6 +411,10 @@ type playerImpl struct {
 	// sent holds the spans of the mix this player's data went into, oldest
 	// first, while they may be unplayed.
 	sent []sentSpan
+
+	// category and priority place the player in ducking, and are guarded by m.
+	category Category
+	priority int
 
 	m sync.Mutex
 }
@@ -584,6 +680,53 @@ func (p *playerImpl) IsPlaying() bool {
 	return p.state == playerPlay
 }
 
+// SetCategory sets the player's category and the priority of its ducking
+// triggers. A player in no category neither triggers ducking nor is ducked.
+//
+// The priority orders the trigger categories when several of them duck the same
+// target: the highest priority wins. It has no effect on a player that is not a
+// trigger. The default priority is 0.
+//
+// SetCategory is concurrent-safe.
+func (p *Player) SetCategory(category Category, priority int) {
+	p.p.setCategory(category, priority)
+}
+
+func (p *playerImpl) setCategory(category Category, priority int) {
+	p.m.Lock()
+	defer p.m.Unlock()
+
+	p.category = category
+	p.priority = priority
+}
+
+// Category returns the player's category.
+//
+// Category is concurrent-safe.
+func (p *Player) Category() Category {
+	return p.p.categoryValue()
+}
+
+func (p *playerImpl) categoryValue() Category {
+	p.m.Lock()
+	defer p.m.Unlock()
+
+	return p.category
+}
+
+// duckingState returns the player's category, its priority, and whether it is
+// playing now.
+func (p *playerImpl) duckingState() playerDucking {
+	p.m.Lock()
+	defer p.m.Unlock()
+
+	return playerDucking{
+		category: p.category,
+		priority: p.priority,
+		playing:  p.state == playerPlay,
+	}
+}
+
 func (p *Player) Volume() float64 {
 	return p.p.Volume()
 }
@@ -719,8 +862,9 @@ func (p *playerImpl) drained() bool {
 }
 
 // readBufferAndAdd adds the player's buffered data to buf, which goes into the
-// mix from sample start.
-func (p *playerImpl) readBufferAndAdd(buf []float32, start int64) int {
+// mix from sample start. gains holds the ducking envelope of each frame, and is
+// nil when the player's category is not ducked.
+func (p *playerImpl) readBufferAndAdd(buf []float32, start int64, gains []float32) int {
 	p.m.Lock()
 	defer p.m.Unlock()
 
@@ -767,6 +911,10 @@ func (p *playerImpl) readBufferAndAdd(buf []float32, start int64) int {
 				rate = 1
 			}
 			s = v * (volume*rate + prevVolume*(1-rate))
+		}
+		if gains != nil {
+			// The gain is the same for every channel of a frame.
+			s *= gains[i/channelCount]
 		}
 
 		// Add the value only when the mixed value stays finite, and skip this player otherwise.

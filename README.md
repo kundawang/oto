@@ -15,6 +15,7 @@ A low-level library to play sound.
     - [Playing sounds from memory](#playing-sounds-from-memory)
     - [Playing sounds by file streaming](#playing-sounds-by-file-streaming)
     - [Advanced usage](#advanced-usage)
+    - [Ducking](#ducking)
   - [Crosscompiling](#crosscompiling)
 
 ## Platforms
@@ -215,6 +216,40 @@ myPlayer.SetBufferSize(newBufferSize)
 ```
 
 `NewPlayer` returns a `*oto.Player`, which has functions like `SetBufferSize` and `Seek`.
+
+### Ducking
+
+A player can be given a category with `Player.SetCategory`, and a context can be told how one
+category attenuates another with `Context.SetDucking`. This is how speech or a game prompt can
+lower background music and then let it come back:
+
+```go
+// One context can have any number of categories.
+const (
+    music = oto.Category("music")
+    voice = oto.Category("voice")
+)
+
+// The music is a target: while a voice plays, its gain falls to 0.25 over
+// 50 ms, and rises back to 1 over 300 ms.
+musicPlayer.SetCategory(music, 0)
+otoCtx.SetDucking(voice, music, oto.DuckingConfig{
+    Gain:    0.25,
+    Attack:  50 * time.Millisecond,
+    Release: 300 * time.Millisecond,
+})
+
+// The voice is a trigger, with a priority for when several triggers duck the
+// same target. Only a playing player triggers ducking.
+voicePlayer.SetCategory(voice, 1)
+voicePlayer.Play() // The music ducks as this plays.
+voicePlayer.Pause() // The music releases.
+```
+
+The gain multiplies the target player's volume, and it follows the sample time of the mix, so the
+ramps advance with the frames mixed. When several triggers duck the same target, the trigger
+category with the highest priority applies, and the target does not release while any trigger
+plays. `Context.ClearDucking` removes a rule.
 
 ## Crosscompiling
 

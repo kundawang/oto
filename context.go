@@ -30,6 +30,71 @@ var (
 	contextCreationMutex sync.Mutex
 )
 
+// DuckingConfig describes how players in a target category are attenuated
+// while at least one player in a trigger category is playing.
+//
+// While the trigger is active, the target's gain moves from 1 down to Gain over
+// Attack, and while no trigger is active, the gain moves back from Gain to 1
+// over Release. The gain multiplies each player's volume.
+//
+// A gain out of the range [0, 1] is clamped to it. A non-finite gain, including
+// NaN, is treated as 1, disabling the attenuation. A negative Attack or Release
+// is treated as 0, which applies the change at once.
+type DuckingConfig struct {
+	// Gain is the volume multiplier applied to the target category while the
+	// trigger category plays. 0 silences the target, and 1 does not attenuate
+	// it.
+	Gain float64
+
+	// Attack is the time the target's gain takes to fall from 1 to Gain.
+	Attack time.Duration
+
+	// Release is the time the target's gain takes to rise from Gain to 1.
+	// Release is also used when a trigger stops while another one ducks the
+	// target, and the gain moves up to the remaining trigger's level.
+	Release time.Duration
+}
+
+// SetDucking configures how players in the trigger category attenuate players
+// in the target category while they are playing. A typical use ducks background
+// music under a voice prompt.
+//
+// An empty trigger or target category names no player, and the rule is ignored.
+// Setting a rule for the same pair of categories replaces its configuration.
+//
+// A player is in a category, with a priority, by Player.SetCategory. Only a
+// playing player triggers ducking. The gain multiplies the target players'
+// volumes, and both channels of a frame get the same gain.
+//
+// The gain follows the sample time of the mix: the ramps are measured in frames
+// of the Context's sample rate, and they advance with the frames mixed, so a
+// mix that pauses does not advance them. A player that pauses is no longer a
+// trigger, and the target starts releasing. A closed player is likewise no
+// longer a trigger.
+//
+// When several rules duck the same target, the rule whose trigger category has
+// the highest priority among its playing players applies; a tie goes to the
+// stronger attenuation. The target does not release while any trigger is
+// playing: when one stops and another continues, the gain moves to the
+// remaining trigger's level at the Release rate.
+//
+// Ducking has no effect on a Context whose mix is not read: a Context that is
+// suspended keeps its gain, and applies it from where it left off on Resume.
+//
+// SetDucking is concurrent-safe.
+func (c *Context) SetDucking(trigger, target Category, config DuckingConfig) {
+	c.context.mux.SetDucking(mux.Category(trigger), mux.Category(target), mux.DuckingConfig(config))
+}
+
+// ClearDucking removes the rule from the trigger category to the target
+// category. A target that is ducked at the time releases over the last
+// configured Release.
+//
+// ClearDucking is concurrent-safe.
+func (c *Context) ClearDucking(trigger, target Category) {
+	c.context.mux.ClearDucking(mux.Category(trigger), mux.Category(target))
+}
+
 // Context is the main object in Oto. It interacts with the audio drivers.
 //
 // To play sound with Oto, first create a context. Then use the context to create
